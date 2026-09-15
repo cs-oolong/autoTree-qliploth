@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 import pandas as pd
 import json
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Tuple, Any
 import logging
@@ -166,6 +167,11 @@ def output_jsonl_path() -> Path:
     return Path(output_dir) / "dialogs_annotated.jsonl"
 
 
+def row_hash(row: Dict[str, Any]) -> str:
+    payload = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
 def save_checkpoint(row: Dict[str, Any], idx: int) -> None:
     """Write one checkpoint file per utterance, then rebuild the merged JSONL."""
     ckpt_dir = checkpoints_dir()
@@ -177,32 +183,41 @@ def save_checkpoint(row: Dict[str, Any], idx: int) -> None:
     jsonl_tmp = output_jsonl_path().with_suffix(".jsonl.tmp")
     with jsonl_tmp.open("w") as f:
         for path in sorted(ckpt_dir.glob("*.json")):
-            f.write(path.read_text().strip() + "\n")
+            ckpt = json.loads(path.read_text())
+            ckpt.pop("_input_hash", None)
+            f.write(json.dumps(ckpt, ensure_ascii=False) + "\n")
     jsonl_tmp.replace(output_jsonl_path())
 
 
 def prepare_checkpoint(dialogs: pd.DataFrame) -> int:
     """
-    Return the next utterance index to annotate, based on the highest
-    contiguous per-utterance JSON checkpoint. A checkpoint count larger
-    than the input row count means the input changed; start fresh.
+    Return the next utterance index to annotate: the first index whose
+    checkpoint is missing or whose stored input hash no longer matches the
+    input row. Checkpoints from that index on are stale and get deleted.
     """
     ckpt_dir = checkpoints_dir()
-    completed = 0
+    start = 0
     if ckpt_dir.exists():
-        while (ckpt_dir / f"{completed:03d}.json").exists():
-            completed += 1
+        for idx in range(len(dialogs)):
+            path = ckpt_dir / f"{idx:03d}.json"
+            if not path.exists():
+                break
+            stored = json.loads(path.read_text())
+            if stored.get("_input_hash") != row_hash(dialogs.iloc[idx].to_dict()):
+                logger.info("Input row %s changed; discarding checkpoints from there on.", idx)
+                break
+            start = idx + 1
+        for stale in ckpt_dir.glob("*.json"):
+            if int(stale.stem) >= start:
+                stale.unlink()
 
-    if completed == 0:
+    if start == 0:
         return 0
-    if completed > len(dialogs):
-        logger.warning("More checkpoints than input rows; starting fresh.")
-        return 0
-    if completed == len(dialogs):
-        logger.info("All %s utterances already annotated; nothing to do.", completed)
+    if start == len(dialogs):
+        logger.info("All %s utterances already annotated; nothing to do.", start)
     else:
-        logger.info("Resuming from utterance %s/%s.", completed + 1, len(dialogs))
-    return completed
+        logger.info("Resuming from utterance %s/%s.", start + 1, len(dialogs))
+    return start
 
 
 def main() -> None:
@@ -295,8 +310,8 @@ def main() -> None:
         previous_text = text
 
         row = {col: utt[col] for col in dialogs.columns}
-        row["Annotations"] = label
-        save_checkpoint(row, idx)
+        ckpt = {"_input_hash": row_hash(row), **row, "Annotations": label}
+        save_checkpoint(ckpt, idx)
         logger.info("Saved checkpoint: %s/%s utterances annotated.", idx + 1, len(dialogs))
 
 
