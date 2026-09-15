@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 import pandas as pd
 import json
+from pathlib import Path
 from typing import List, Dict, Tuple, Any
 import logging
 
@@ -22,7 +23,7 @@ os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 parser = argparse.ArgumentParser()
 parser.add_argument("-d", "--dialogs_path", type=str, help="Path to input dialogs file")
 parser.add_argument("-t", "--tree_path", type=str, help="Path to decision tree file")
-parser.add_argument("-m", "--model", type=str, default="gpt-4o", help="OpenAI model to use")
+parser.add_argument("-m", "--model", type=str, default="gpt-4o-mini", help="OpenAI model to use")
 parser.add_argument("-b", "--binary", type=bool, default=False, help="Whether to use binary tree")
 parser.add_argument("-o", "--output_dir", type=str, help="Output directory for results")
 args = parser.parse_args()
@@ -157,14 +158,59 @@ def iterate_over_questions_non_binary(
     return current_node["groups"][0]["data"][0]
 
 
+def checkpoints_dir() -> Path:
+    return Path(output_dir) / "checkpoints"
+
+
+def output_jsonl_path() -> Path:
+    return Path(output_dir) / "dialogs_annotated.jsonl"
+
+
+def save_checkpoint(row: Dict[str, Any], idx: int) -> None:
+    """Write one checkpoint file per utterance, then rebuild the merged JSONL."""
+    ckpt_dir = checkpoints_dir()
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    tmp = ckpt_dir / f"{idx:03d}.json.tmp"
+    tmp.write_text(json.dumps(row, ensure_ascii=False, default=str))
+    tmp.replace(ckpt_dir / f"{idx:03d}.json")
+
+    jsonl_tmp = output_jsonl_path().with_suffix(".jsonl.tmp")
+    with jsonl_tmp.open("w") as f:
+        for path in sorted(ckpt_dir.glob("*.json")):
+            f.write(path.read_text().strip() + "\n")
+    jsonl_tmp.replace(output_jsonl_path())
+
+
+def prepare_checkpoint(dialogs: pd.DataFrame) -> int:
+    """
+    Return the next utterance index to annotate, based on the highest
+    contiguous per-utterance JSON checkpoint. A checkpoint count larger
+    than the input row count means the input changed; start fresh.
+    """
+    ckpt_dir = checkpoints_dir()
+    completed = 0
+    if ckpt_dir.exists():
+        while (ckpt_dir / f"{completed:03d}.json").exists():
+            completed += 1
+
+    if completed == 0:
+        return 0
+    if completed > len(dialogs):
+        logger.warning("More checkpoints than input rows; starting fresh.")
+        return 0
+    if completed == len(dialogs):
+        logger.info("All %s utterances already annotated; nothing to do.", completed)
+    else:
+        logger.info("Resuming from utterance %s/%s.", completed + 1, len(dialogs))
+    return completed
+
+
 def main() -> None:
     """
     Main function to process dialog file and generate annotations.
     Reads input dialogs, processes each utterance through decision tree,
-    and saves annotated results.
+    and saves annotated results incrementally after each utterance.
     """
-    annotations_list = []
-
     # Load dialogs file
     if dialogs_path.endswith(".csv"):
         dialogs = pd.read_csv(dialogs_path)
@@ -175,6 +221,8 @@ def main() -> None:
     else:
         raise ValueError(f"Invalid file type: {dialogs_path}")
 
+    start_idx = prepare_checkpoint(dialogs)
+
     # Load decision tree
     with open(tree_path, "r") as f:
         questions_tree = json.load(f)
@@ -183,8 +231,14 @@ def main() -> None:
     dialog_id_prev = None
     previous_speaker = None
     previous_text = None
+    if 0 < start_idx <= len(dialogs):
+        prev = json.loads((checkpoints_dir() / f"{start_idx - 1:03d}.json").read_text())
+        dialog_id_prev = prev["dialog_id"]
+        previous_speaker = prev["speaker"]
+        previous_text = prev["text"]
 
-    for _, utt in dialogs.iterrows():
+    for idx in range(start_idx, len(dialogs)):
+        utt = dialogs.iloc[idx]
         dialog_id = utt["dialog_id"]
         logger.info(f"Dialog ID: {dialog_id}")
 
@@ -239,13 +293,11 @@ def main() -> None:
         # Update previous utterance info
         previous_speaker = speaker
         previous_text = text
-        annotations_list.append(label)
 
-
-    # Save results
-    dialogs["Annotations"] = annotations_list
-    os.makedirs(output_dir, exist_ok=True)
-    dialogs.to_csv(f"{output_dir}/dialogs_annotated.tsv", index=False, sep="\t")
+        row = {col: utt[col] for col in dialogs.columns}
+        row["Annotations"] = label
+        save_checkpoint(row, idx)
+        logger.info("Saved checkpoint: %s/%s utterances annotated.", idx + 1, len(dialogs))
 
 
 if __name__ == "__main__":
